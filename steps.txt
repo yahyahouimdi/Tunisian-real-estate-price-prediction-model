@@ -1,0 +1,56 @@
+1. Objectif du projet
+
+Un système qui : à partir d'une annonce (scrapée ou saisie par l'utilisateur), prédit le prix estimé d'un bien (maison/appartement) en Tunisie → problème de régression supervisée.
+
+2. Collecte des données (scraping)
+Sources : Tayara, Mubawab, Technocasa, Fizmoov, etc. — idéalement plusieurs sites pour diversifier et éviter le biais d'une seule plateforme.
+Outils : BeautifulSoup/Scrapy pour le HTML statique, Selenium/Playwright si contenu dynamique (JS).
+Attention : respecter les CGU/robots.txt de chaque site, throttling pour ne pas se faire bloquer, rotation d'user-agents si besoin.
+Stocker les données brutes (raw) séparément avant tout nettoyage — toujours garder une copie originale.
+3. Variables à collecter (features)
+
+Tu avais surface, nombre de pièces, prix, localisation — voici une liste plus complète typique pour l'immobilier tunisien :
+
+Catégorie	Variables
+Localisation	Gouvernorat, ville/délégation, quartier, latitude/longitude si dispo
+Surface	Surface habitable (m²), surface terrain si maison
+Structure	Nb pièces, nb chambres, nb salles de bain, étage, nb étages total
+État	Neuf/à rénover/ancien, année de construction
+Équipements	Ascenseur, garage/parking, jardin, piscine, climatisation, chauffage
+Type de bien	Appartement, maison, villa, duplex, studio
+Type de transaction	Vente/location (important — à ne pas mélanger !)
+Cible	Prix (TND)
+
+C'est un point critique : il faut absolument séparer vente et location dès la collecte, sinon le modèle va apprendre n'importe quoi (les échelles de prix sont totalement différentes).
+
+4. Data preprocessing & cleaning
+Nettoyage texte → nombre : les annonces ont souvent prix/surface en texte libre ("250 m²", "250m2", "250 M²") → normaliser avec regex.
+Valeurs manquantes : imputation (médiane par gouvernorat pour surface, mode pour nb pièces) ou suppression si trop de manques.
+Outliers : prix aberrants (annonces test, prix à 1 TND, surfaces à 10000m²) → détection par IQR ou z-score, surtout par zone géographique (un prix "normal" à Tunis ne l'est pas à Kasserine).
+Doublons : même annonce postée sur plusieurs sites ou reposée plusieurs fois.
+Normalisation/standardisation : StandardScaler ou MinMaxScaler sur les variables numériques (surface, prix si besoin selon le modèle).
+Encoding catégoriel : One-Hot Encoding pour type de bien, Target/Frequency Encoding pour gouvernorat/quartier (trop de catégories pour du one-hot pur).
+Feature engineering : prix au m² comme variable dérivée (utile pour la validation/détection d'outliers), densité de biens par zone, etc.
+5. Split train/validation/test
+Split classique 70/15/15 ou 80/10/10.
+Stratifié par gouvernorat (et éventuellement par tranche de prix) pour garantir que chaque région de Tunisie est bien représentée dans les 3 sets — c'est exactement ce que tu mentionnais par "équilibré et varié".
+Attention au data leakage : si plusieurs annonces du même bien existent (reposté), elles doivent être dans le même split.
+6. Modélisation
+Baseline simple : régression linéaire / Ridge / Lasso (interprétable, bon point de départ).
+Modèles plus robustes : Random Forest Regressor, Gradient Boosting (XGBoost, LightGBM, CatBoost — CatBoost gère bien les variables catégorielles genre quartier sans encoding lourd).
+Cross-validation (k-fold, stratifiée par région) pour une estimation fiable de la performance, pas juste un split unique.
+7. Évaluation / précision du modèle
+
+Métriques adaptées à la régression :
+
+MAE (erreur moyenne en TND — facile à interpréter)
+RMSE (pénalise plus les grosses erreurs)
+R² (variance expliquée)
+MAPE (erreur en %, utile pour comparer entre zones à prix très différents)
+8. Data augmentation (si dataset trop petit)
+
+Pour du tabulaire (pas d'image), les techniques classiques :
+
+SMOTE-like pour régression (SMOGN) — génère des exemples synthétiques en zones sous-représentées.
+Perturbation légère des features numériques (bruit gaussien contrôlé) pour créer des variantes.
+Scraping supplémentaire ciblé sur les gouvernorats sous-représentés plutôt que de la pure augmentation synthétique — souvent plus fiable en immobilier vu que les patterns de prix sont très locaux.
