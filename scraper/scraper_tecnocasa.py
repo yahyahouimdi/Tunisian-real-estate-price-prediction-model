@@ -123,9 +123,17 @@ def scrape_with_playwright(out_csv: str = "annonces_tecnocasa.csv"):
         for transaction, type_bien, url in LISTING_URLS:
             print(f"[Tecnocasa] Chargement listing: {url}")
             try:
-                page.goto(url, wait_until="networkidle", timeout=30000)
+                # Tecnocasa keeps analytics/background requests active, so
+                # ``networkidle`` often never occurs even though the listing
+                # itself has rendered.  Wait for the document, then for the
+                # actual listing cards instead.
+                response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                if response and not response.ok:
+                    print(f"  erreur HTTP {response.status}")
+                    continue
+                page.locator(CARD_SELECTOR).first.wait_for(state="attached", timeout=20000)
             except Exception as e:
-                print(f"  erreur chargement -> {e}")
+                print(f"  erreur chargement / cartes absentes -> {e}")
                 continue
 
             page.wait_for_timeout(2000)
@@ -175,7 +183,9 @@ def scrape_with_playwright(out_csv: str = "annonces_tecnocasa.csv"):
         for href, (transaction, type_bien, card) in cards_by_href.items():
             full_text = ""
             try:
-                page.goto(href, wait_until="networkidle", timeout=30000)
+                # Same reason as listings: do not wait indefinitely for
+                # unrelated background requests to become idle.
+                page.goto(href, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(1000)
                 html = page.content()
                 detail_soup = BeautifulSoup(html, "html.parser")
