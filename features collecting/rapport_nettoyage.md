@@ -1,46 +1,43 @@
-# Rapport de nettoyage — dataset_immo_tunisie
+# Cleaning Report — `dataset_immo_tunisie`
 
-## Dataset brut : 2385 lignes, 22 colonnes
-Sources : {'tayara': np.int64(1716), 'mubawab': np.int64(573), 'tecnocasa': np.int64(96)}
+## Raw dataset
 
-### 1) type_transaction='inconnu' supprimées : 9 lignes retirées
+- Rows: 2,385
+- Columns: 22
+- Sources: Tayara (1,716), Mubawab (573), Tecnocasa (96)
 
-### 2) Prix Tecnocasa corrigés (mensualité crédit -> prix réel) : 96/96
-### 3) Prix Mubawab manquants comblés depuis le texte : 492/570
-### 4) Prix Tayara hors bornes plausibles : 90 détectés, 1 corrigés, 89 mis à NaN (irrécupérables)
+## Cleaning results
 
-Taux de prix manquant après nettoyage : 29.3% (vs 46.2% avant)
+1. Removed 9 listings with an unknown transaction type.
+2. Corrected all 96 Tecnocasa prices: the scraped values were monthly loan instalments rather than actual listing prices.
+3. Recovered 492 of 570 missing Mubawab prices from the raw description text.
+4. Detected 90 implausible Tayara prices caused by digit concatenation; 1 was recovered and 89 were set to missing.
+5. Standardized all governorates to the 24 official Tunisian governorates; no values remained unresolved.
+6. Removed 29 price-per-square-metre outliers using IQR × 2.5 within each governorate and transaction type.
+7. Removed 3 listings with a zero surface area.
+8. Removed 1 duplicate listing based on matching title, governorate, surface, price, and room count.
 
-### 5) Gouvernorats normalisés sur les 24 officiels. Non résolus (mis à NaN) : 0
+The missing-price rate fell from 46.2% to 29.3% after price recovery and correction.
 
-### 6) Outliers prix_m2 retirés (IQR x2.5, par gouvernorat+transaction) : 29 lignes
-### 7) Lignes surface_m2=0 retirées : 3
+## Final cleaned dataset
 
-### 8) Doublons retirés (titre+gouvernorat+surface+prix+pièces identiques) : 1
+- Rows: 2,343 (98.2% of the raw data retained)
+- Columns: 19
+- Transactions: 1,289 sales and 1,054 rentals
 
-## Dataset final : 2343 lignes (98.2% du brut conservé), 19 colonnes
+| Field | Missing values |
+|---|---:|
+| `ville` | 24.7% |
+| `prix_dt` | 29.6% |
+| `prix_m2` | 55.1% |
+| `surface_m2` | 45.9% |
+| `nb_pieces` | 28.1% |
+| `nb_chambres` | 2.6% |
+| `nb_salles_bain` | 14.3% |
+| `etage` | 72.4% |
 
-Répartition vente/location : {'vente': np.int64(1289), 'location': np.int64(1054)}
-Taux de valeurs manquantes restantes :
-id                    0.0
-source                0.0
-type_transaction      0.0
-type_bien             0.0
-gouvernorat           0.0
-ville                24.7
-prix_dt              29.6
-prix_m2              55.1
-surface_m2           45.9
-nb_pieces            28.1
-nb_chambres           2.6
-nb_salles_bain       14.3
-etage                72.4
-ascenseur             0.0
-parking               0.0
-piscine               0.0
-climatisation         0.0
-chauffage_central     0.0
-meuble                0.0
+All remaining binary amenity fields and the core source, transaction, property-type, and governorate fields are complete.
 
-## Sous-ensemble 'prêt pour l'entraînement' (prix_dt non-null) : 1650 lignes -> /mnt/user-data/outputs/dataset_immo_tunisie_train_ready.csv
-Répartition : {'vente': np.int64(1019), 'location': np.int64(631)}
+## Training-ready subset
+
+Filtering the cleaned dataset to listings with a known target price produces **1,650 rows**: 1,019 sales and 631 rentals. Missing predictor values will be imputed only after splitting the data into training and test sets, preventing data leakage.
