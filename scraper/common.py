@@ -88,26 +88,111 @@ class Annonce:
     meuble: Optional[bool] = None
     description_brute: str = ""
     date_scraping: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    date_publication: Optional[str] = None
 
 
 FIELDNAMES = list(Annonce.__dataclass_fields__.keys())
 
 
+# ----------------------------------------------------------------------
+# robots.txt (avec jokers * et $, que urllib.robotparser ne gère pas)
+# ----------------------------------------------------------------------
+
+_ROBOTS_CACHE: dict[str, list[tuple[bool, re.Pattern]]] = {}
+
+
+def _load_robots_rules(session: requests.Session, base: str) -> list[tuple[bool, re.Pattern]]:
+    """Règles Allow/Disallow du groupe 'User-agent: *' de base/robots.txt."""
+    try:
+        text = session.get(f"{base}/robots.txt", timeout=15).text
+    except requests.RequestException:
+        return []
+
+    rules, in_star_group = [], False
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if ":" not in line:
+            continue
+        key, value = (p.strip() for p in line.split(":", 1))
+        key = key.lower()
+        if key == "user-agent":
+            in_star_group = value == "*"
+        elif in_star_group and key in ("allow", "disallow") and value:
+            pattern = re.escape(value).replace(r"\*", ".*")
+            if pattern.endswith(r"\$"):
+                pattern = pattern[:-2] + "$"
+            rules.append((key == "allow", re.compile(pattern)))
+    return rules
+
+
+def robots_allowed(session: requests.Session, url: str) -> bool:
+    """True si l'URL est autorisée pour 'User-agent: *' (règle la plus longue gagne)."""
+    m = re.match(r"(https?://[^/]+)(.*)", url)
+    base, path = m.group(1), m.group(2) or "/"
+    if base not in _ROBOTS_CACHE:
+        _ROBOTS_CACHE[base] = _load_robots_rules(session, base)
+
+    best_len, allowed = -1, True
+    for is_allow, pattern in _ROBOTS_CACHE[base]:
+        if pattern.match(path) and len(pattern.pattern) > best_len:
+            best_len, allowed = len(pattern.pattern), is_allow
+    return allowed
+
+
+# ----------------------------------------------------------------------
+# Sauvegarde incrémentale + reprise après interruption
+# ----------------------------------------------------------------------
+
+def load_seen_ids(path: str) -> set[str]:
+    """IDs déjà présents dans le CSV (pour reprendre une collecte interrompue)."""
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            return {row["id"] for row in csv.DictReader(f)}
+    except FileNotFoundError:
+        return set()
+
+
+def append_annonce(a: Annonce, path: str):
+    """Ajoute UNE annonce au CSV immédiatement (rien n'est perdu en cas de crash)."""
+    save_annonces_csv([a], path, mode="a")
+
+
 def save_annonces_csv(annonces: list[Annonce], path: str, mode: str = "a"):
     """Ajoute (mode='a') ou écrase (mode='w') les annonces dans un CSV."""
     write_header = mode == "w"
-    try:
-        with open(path, "r", encoding="utf-8"):
-            write_header = False
-    except FileNotFoundError:
-        write_header = True
+    if not write_header:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                write_header = not f.read(1)
+        except FileNotFoundError:
+            write_header = True
 
     with open(path, mode, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         if write_header:
             writer.writeheader()
         for a in annonces:
-            writer.writerow(asdict(a))
+            row = asdict(a)
+            row["titre"] = mask_contacts(row["titre"])
+            row["description_brute"] = mask_contacts(row["description_brute"])
+            writer.writerow(row)
+
+
+# Données personnelles écrites par les vendeurs dans le texte libre.
+# Numéros tunisiens à 8 chiffres (avec ou sans +216 / espaces), sauf s'ils
+# sont suivis d'une devise (c'est alors un prix).
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+PHONE_RE = re.compile(
+    r"(?<!\d)(?:(?:\+|00)\s?216[\s.-]?)?[2-9](?:[\s.-]?\d){7}(?!\d)"
+    r"(?!\s*(?:DT|TND|dinars?|mill)\b)",
+    re.I,
+)
+
+
+def mask_contacts(text):
+    if not isinstance(text, str):
+        return text
+    return PHONE_RE.sub("[tel]", EMAIL_RE.sub("[email]", text))
 
 
 # ----------------------------------------------------------------------
