@@ -1,234 +1,178 @@
 """
 scraper_tecnocasa.py
-Scrape les annonces de tecnocasa.tn.
+Scrape les annonces de vente (appartements + villas) de tecnocasa.tn.
 
-IMPORTANT — différence avec Tayara/Mubawab :
-La grille d'annonces est chargée dynamiquement en JavaScript (SPA Vue.js)
-après le chargement de la page -> `requests` + BeautifulSoup ne suffisent
-PAS ici. Playwright est nécessaire pour exécuter le JS et récupérer le DOM
-final.
+Structure observée (vérifiée en octobre 2026) :
+- robots.txt : tout autorisé (sauf /flush_all) et publie des sitemaps.
+- Sitemap des biens résidentiels :
+    https://www.tecnocasa.tn/sitemap/residentiel.xml.gz
+  ~2 300 URLs, dont ~780 appartements et ~530 villas à vendre :
+    https://www.tecnocasa.tn/vendre/appartement/{province}/{ville}/{id}.html
+    https://www.tecnocasa.tn/vendre/villa/{province}/{ville}/{id}.html
+- Chaque page d'annonce embarque l'annonce complète en JSON dans l'attribut
+  Vue  :estate="{...}"  (HTML-échappé) : prix et surface numériques, pièces,
+  salles de bain, étage, équipements, année de construction, etc.
 
-Sélecteur confirmé via DevTools (clic droit sur une carte -> Inspecter) le
-03/09/2026 :
-    CARD_LINK_SELECTOR = "div.estates-list > div > a"
-Chaque carte est un unique <a href="https://www.tecnocasa.tn/...html">
-contenant directement :
-    .estate-card-current-price span   -> "259 000 DT"
-    .estate-card-title                -> "S+2 en vente"
-    .estate-card-subtitle             -> "Ariana - Riadh Landalous"
-    .estate-card-rooms span           -> "3 pièces"
-    .estate-card-surface span         -> "89 m²"
-=> On récupère prix / titre / gouvernorat-quartier / pièces / surface
-   DIRECTEMENT sur la page de listing (fiable, structuré), et on ne va sur
-   la page de détail QUE pour tenter de compléter les champs absents de la
-   carte (étage, salle de bain, équipements) via les regex de common.py.
+=> Plus besoin de Playwright ni de scroller la grille JS : on lit le sitemap,
+puis le JSON de chaque page avec requests.
 
-URLs de listing connues (patron NON uniforme, confirmé par observation) :
-  https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/grand-tunis/ariana.html
-  https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/bizerte.html
-  https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/cap-bon.html
-Remarque : certains gouvernorats sont imbriqués sous "grand-tunis/", d'autres
-sont directement sous le region-slug ("nord-est-ne", "centre-est-ce", ...).
-Il n'existe PAS un simple gabarit {region}/{ville} valide partout -> on liste
-des chemins complets ci-dessous plutôt que de les reconstruire.
-
-TODO (Yahya) : cette liste ne couvre pas encore les 24 gouvernorats x
-{vendre, louer} x {appartement, maison}. Pour la compléter, navigue le site
-(filtre région/ville) et ajoute chaque URL complète trouvée dans
-LISTING_URLS. Le plus rapide : ouvre chaque page région (ex. .../nord-est-ne
-.html) et relève les liens vers les pages gouvernorat/ville qu'elle contient.
-
-TODO (Yahya) : la pagination n'est PAS confirmée. Le site semble être une SPA
-Vue -> probable "scroll infini" ou bouton "Voir plus". Le code ci-dessous
-scrolle et clique un éventuel bouton "load more" tant que de nouvelles cartes
-apparaissent, mais le sélecteur du bouton (LOAD_MORE_SELECTOR) est un
-best-effort à confirmer/adapter via DevTools sur une page de listing.
+On ne lit pas les champs "agency" / "agent" (coordonnées de l'agence).
 """
 
+import gzip
+import html
+import json
 import re
+
 from bs4 import BeautifulSoup
 
-from common import Annonce, save_annonces_csv, enrich_common_fields, polite_sleep
+from common import (
+    Annonce, get_session, polite_sleep, enrich_common_fields,
+    append_annonce, load_seen_ids, robots_allowed,
+)
 
-# Confirmé via DevTools le 03/09/2026 (voir docstring ci-dessus).
-CARD_SELECTOR = "div.estates-list > div > a"
+BASE = "https://www.tecnocasa.tn"
+SITEMAP_URL = f"{BASE}/sitemap/residentiel.xml.gz"
 
-# TODO: à confirmer/adapter via DevTools. Best-effort pour déclencher le
-# chargement de cartes supplémentaires (bouton "Voir plus" / "Charger plus").
-LOAD_MORE_SELECTOR = "button:has-text('Voir plus'), button:has-text('Charger plus')"
+# segment d'URL -> type_bien du projet
+TYPES_BIEN = {
+    "appartement": "appartement",
+    "villa": "maison_villa",
+}
 
-# Chemins complets connus (transaction, type_bien, url). À compléter (voir TODO).
-LISTING_URLS = [
-    ("vente", "appartement", "https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/grand-tunis/ariana.html"),
-    ("vente", "appartement", "https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/grand-tunis/ennasr.html"),
-    ("vente", "appartement", "https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/grand-tunis/el-menzah.html"),
-    ("vente", "appartement", "https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/grand-tunis/le-bardo.html"),
-    ("vente", "appartement", "https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/bizerte.html"),
-    ("vente", "appartement", "https://www.tecnocasa.tn/vendre/appartement/nord-est-ne/cap-bon.html"),
-    ("vente", "appartement", "https://www.tecnocasa.tn/vendre/appartement/centre-est-ce/sousse.html"),
-]
+ESTATE_RE = re.compile(r':estate="(.*?)"', re.S)
+SALE_URL_RE = re.compile(r"^https://www\.tecnocasa\.tn/vendre/([a-z-]+)/.+/(\d+)\.html$")
 
 
-def _text(el, selector):
-    node = el.select_one(selector)
-    return node.get_text(strip=True) if node else ""
-
-
-def _parse_card(a_tag) -> dict:
-    """Extrait les champs directement visibles sur la carte de listing."""
-    href = a_tag.get("href", "")
-    prix_txt = _text(a_tag, ".estate-card-current-price span")
-    titre = _text(a_tag, ".estate-card-title")
-    subtitle = _text(a_tag, ".estate-card-subtitle")  # "Ariana - Riadh Landalous"
-    pieces_txt = _text(a_tag, ".estate-card-rooms span")
-    surface_txt = _text(a_tag, ".estate-card-surface span")
-
-    gouvernorat, quartier = None, None
-    if " - " in subtitle:
-        gouvernorat, quartier = [p.strip() for p in subtitle.split(" - ", 1)]
-    elif subtitle:
-        gouvernorat = subtitle.strip()
-
-    return {
-        "href": href,
-        "prix_txt": prix_txt,
-        "titre": titre,
-        "gouvernorat": gouvernorat,
-        "quartier": quartier,
-        "pieces_txt": pieces_txt,
-        "surface_txt": surface_txt,
-    }
-
-
-def scrape_with_playwright(out_csv: str = "annonces_tecnocasa.csv"):
+def sale_urls_from_sitemap(session) -> list[tuple[str, str]]:
+    """[(type_bien, url)] des appartements/villas à vendre du sitemap."""
+    resp = session.get(SITEMAP_URL, timeout=30)
+    resp.raise_for_status()
+    content = resp.content
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise SystemExit(
-            "Playwright n'est pas installé. Lance:\n"
-            "  pip install playwright --break-system-packages\n"
-            "  playwright install chromium"
-        )
+        content = gzip.decompress(content)
+    except OSError:
+        pass  # déjà décompressé par le serveur / requests
 
-    # href -> (transaction, type_bien, card_data)
-    cards_by_href = {}
+    out = []
+    for url in re.findall(r"<loc>(.*?)</loc>", content.decode("utf-8", "ignore")):
+        m = SALE_URL_RE.match(url.strip())
+        if m and m.group(1) in TYPES_BIEN:
+            out.append((TYPES_BIEN[m.group(1)], url.strip()))
+    return out
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ))
 
-        for transaction, type_bien, url in LISTING_URLS:
-            print(f"[Tecnocasa] Chargement listing: {url}")
-            try:
-                # Tecnocasa keeps analytics/background requests active, so
-                # ``networkidle`` often never occurs even though the listing
-                # itself has rendered.  Wait for the document, then for the
-                # actual listing cards instead.
-                response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                if response and not response.ok:
-                    print(f"  erreur HTTP {response.status}")
-                    continue
-                page.locator(CARD_SELECTOR).first.wait_for(state="attached", timeout=20000)
-            except Exception as e:
-                print(f"  erreur chargement / cartes absentes -> {e}")
-                continue
+def get_estate(session, url: str) -> dict:
+    resp = session.get(url, timeout=30)
+    resp.raise_for_status()
+    m = ESTATE_RE.search(resp.text)
+    if not m:
+        raise ValueError("JSON :estate introuvable (annonce retirée ou site modifié ?)")
+    return json.loads(html.unescape(m.group(1)))
 
-            page.wait_for_timeout(2000)
 
-            # Best-effort: scroll + clic "voir plus" tant que le nombre de
-            # cartes augmente (SPA -> pagination probable par scroll infini).
-            # TODO: confirmer ce comportement, adapter si c'est en réalité
-            # une pagination classique par numéro de page (?page=2 etc.)
-            previous_count = -1
-            stable_rounds = 0
-            for _ in range(30):  # garde-fou anti-boucle infinie
-                current_count = page.locator(CARD_SELECTOR).count()
-                if current_count == previous_count:
-                    stable_rounds += 1
-                    if stable_rounds >= 2:
-                        break
-                else:
-                    stable_rounds = 0
-                previous_count = current_count
+def _yes_no(value):
+    """'Oui'/'Non'/True/False -> bool ; vide ou inconnu -> None."""
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"oui", "yes", "1", "true"}:
+        return True
+    if text in {"non", "no", "0", "false"}:
+        return False
+    return None
 
-                page.mouse.wheel(0, 3000)
-                page.wait_for_timeout(800)
-                try:
-                    btn = page.locator(LOAD_MORE_SELECTOR).first
-                    if btn.is_visible(timeout=500):
-                        btn.click(timeout=500)
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
 
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            found = soup.select(CARD_SELECTOR)
-            print(f"  {len(found)} cartes trouvées")
+def _number(value):
+    m = re.search(r"\d+(?:[.,]\d+)?", str(value or "").replace(" ", ""))
+    return float(m.group(0).replace(",", ".")) if m else None
 
-            for a_tag in found:
-                card = _parse_card(a_tag)
-                href = card["href"]
-                if not href.startswith("https://www.tecnocasa.tn"):
-                    continue
-                cards_by_href[href] = (transaction, type_bien, card)
 
-            polite_sleep()
+def build_annonce(estate: dict, url: str, type_bien: str) -> Annonce:
+    features = estate.get("features") or {}
+    titre = estate.get("title") or ""
+    description = BeautifulSoup(estate.get("description") or "", "html.parser").get_text(" ", strip=True)
+    data = {d.get("label"): d.get("valore") for d in estate.get("data") or []}
 
-        print(f"[Tecnocasa] Total {len(cards_by_href)} annonces détectées, scraping des détails...")
-        all_annonces = []
-        for href, (transaction, type_bien, card) in cards_by_href.items():
-            full_text = ""
-            try:
-                # Same reason as listings: do not wait indefinitely for
-                # unrelated background requests to become idle.
-                page.goto(href, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(1000)
-                html = page.content()
-                detail_soup = BeautifulSoup(html, "html.parser")
-                full_text = detail_soup.get_text(separator=" ", strip=True)
-            except Exception as e:
-                print(f"  erreur détail {href} -> {e}")
+    a = Annonce(
+        id=f"tecnocasa_{estate.get('id')}",
+        source="tecnocasa",
+        url=url,
+        type_transaction="vente",
+        type_bien=type_bien,
+        titre=titre,
+        description_brute=description[:3000],
+        date_publication=estate.get("last_published_at"),
+    )
+    enrich_common_fields(a, f"{titre}\n{description}")
+    a.type_transaction = "vente"
 
-            # Texte enrichi: on préfixe avec les champs fiables de la carte
-            # pour que les regex de common.py les retrouvent même si la
-            # page de détail a une mise en page différente ou n'a pas pu
-            # être chargée.
-            card_summary = (
-                f"{card['titre']} {card['prix_txt']} {card['gouvernorat'] or ''} "
-                f"{card['quartier'] or ''} {card['pieces_txt']} {card['surface_txt']}"
-            )
-            combined_text = card_summary + " " + full_text
+    a.prix_dt = _number(estate.get("numeric_price"))
+    a.surface_m2 = _number(estate.get("numeric_surface"))
+    a.gouvernorat = (estate.get("province") or {}).get("title") or a.gouvernorat
+    a.ville = (estate.get("city") or {}).get("title") or None
 
-            ad_id = re.sub(r"\W+", "_", href.rstrip("/").split("/")[-1])[:60]
-            a = Annonce(
-                id=f"tecnocasa_{ad_id}",
-                source="tecnocasa",
-                url=href,
-                type_transaction=transaction,
-                type_bien=type_bien,
-                titre=card["titre"],
-                description_brute=full_text[:3000],
-            )
-            enrich_common_fields(a, combined_text)
-            # La carte donne le gouvernorat de façon plus fiable que la regex
-            # sur texte libre -> on la privilégie si elle a trouvé quelque chose.
-            if card["gouvernorat"]:
-                a.gouvernorat = card["gouvernorat"]
-            if card["quartier"]:
-                a.ville = card["quartier"]
-            all_annonces.append(a)
-            polite_sleep()
+    # Tecnocasa compte les pièces au total (salon inclus) : "4 pièces" = S+3.
+    # nb_pieces suit la convention du projet (N de "S+N").
+    pieces = _number(data.get("Pièces") or estate.get("rooms"))
+    bedrooms = _number(features.get("bedrooms"))
+    if a.nb_pieces is None and pieces:
+        a.nb_pieces = int(pieces) - 1
+    if bedrooms is not None:
+        a.nb_chambres = int(bedrooms)
+    elif a.nb_pieces is not None:
+        a.nb_chambres = a.nb_pieces
 
-        browser.close()
+    bathrooms = _number(estate.get("bathrooms"))
+    if bathrooms is not None:
+        a.nb_salles_bain = int(bathrooms)
 
-    save_annonces_csv(all_annonces, out_csv, mode="w")
-    print(f"[Tecnocasa] {len(all_annonces)} annonces sauvegardées dans {out_csv}")
-    return all_annonces
+    floor = str(features.get("floor") or "").strip()
+    if floor:
+        a.etage = f"{floor} étage" if floor.isdigit() else floor
+
+    # Équipements structurés : connus -> True/False ; inconnus -> None
+    # (le nettoyage complète les inconnus à partir de la description).
+    car_places = _number(features.get("car_places"))
+    a.ascenseur = _yes_no(features.get("elevator"))
+    a.climatisation = _yes_no(features.get("air_conditioning"))
+    a.chauffage_central = _yes_no(features.get("heating"))
+    a.meuble = _yes_no(features.get("furnitured"))
+    a.parking = True if car_places else _yes_no(features.get("box"))
+    a.piscine = None
+
+    return a
+
+
+def run(max_annonces: int = None, out_csv: str = "annonces_tecnocasa.csv"):
+    """
+    max_annonces: None = tout le sitemap (collecte complète).
+    Reprise automatique : les annonces déjà présentes dans out_csv sont ignorées.
+    """
+    session = get_session()
+    seen = load_seen_ids(out_csv)
+    print(f"[Tecnocasa] {len(seen)} annonces déjà collectées (reprise)")
+
+    urls = sale_urls_from_sitemap(session)
+    print(f"[Tecnocasa] {len(urls)} annonces de vente dans le sitemap")
+
+    n_saved = 0
+    for type_bien, url in urls:
+        if max_annonces and n_saved >= max_annonces:
+            break
+        ad_id = "tecnocasa_" + SALE_URL_RE.match(url).group(2)
+        if ad_id in seen or not robots_allowed(session, url):
+            continue
+        seen.add(ad_id)
+        try:
+            append_annonce(build_annonce(get_estate(session, url), url, type_bien), out_csv)
+            n_saved += 1
+        except Exception as e:
+            print(f"    erreur détail {url} -> {e}")
+        polite_sleep()
+
+    print(f"[Tecnocasa] {n_saved} annonces ajoutées dans {out_csv}")
 
 
 if __name__ == "__main__":
-    scrape_with_playwright()
+    run(max_annonces=5)
