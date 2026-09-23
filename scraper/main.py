@@ -1,15 +1,21 @@
 """
 main.py
-Lance les 3 scrapers et fusionne les CSV individuels en un seul dataset
-prêt pour la phase de preprocessing / modélisation.
+Lance les 3 scrapers (vente uniquement) et fusionne les CSV individuels en
+un seul dataset prêt pour le nettoyage (features collecting/clean_dataset.py).
 
 Usage:
-    python main.py                # lance tout avec des paramètres restreints (test)
-    python main.py --full         # lance avec une couverture plus large (production)
+    python main.py                # test rapide (peu de pages)
+    python main.py --full         # collecte complète (plusieurs heures)
+    python main.py --merge-only   # refait seulement la fusion des CSV
+
+Chaque scraper sauvegarde au fil de l'eau et reprend là où il s'est arrêté :
+relancer la même commande après une interruption ne recollecte pas les
+annonces déjà présentes dans annonces_*.csv.
 """
 
 import argparse
 import glob
+
 import pandas as pd
 
 import scraper_tayara
@@ -20,7 +26,7 @@ from common import FIELDNAMES
 
 def merge_all(pattern: str = "annonces_*.csv", out_path: str = "dataset_immo_tunisie.csv"):
     frames = []
-    for f in glob.glob(pattern):
+    for f in sorted(glob.glob(pattern)):
         try:
             df = pd.read_csv(f)
             frames.append(df)
@@ -33,27 +39,31 @@ def merge_all(pattern: str = "annonces_*.csv", out_path: str = "dataset_immo_tun
         return
 
     merged = pd.concat(frames, ignore_index=True)
-    # dédoublonnage grossier: même titre + même gouvernorat + même prix + même surface
-    merged.drop_duplicates(subset=["titre", "gouvernorat", "prix_dt", "surface_m2"], inplace=True)
+    merged = merged.reindex(columns=FIELDNAMES)
+    # Même annonce collectée deux fois -> même id. Les doublons de contenu
+    # (même bien sur plusieurs sites) sont traités dans le nettoyage.
+    merged = merged.drop_duplicates(subset=["id"], keep="last")
     merged.to_csv(out_path, index=False)
     print(f"\nDataset fusionné: {len(merged)} annonces uniques -> {out_path}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--full", action="store_true", help="Couverture large (plus long)")
+    parser.add_argument("--full", action="store_true", help="Collecte complète (plusieurs heures)")
+    parser.add_argument("--merge-only", action="store_true", help="Fusionne seulement les CSV existants")
     args = parser.parse_args()
 
-    if args.full:
-        scraper_tayara.run(max_pages_per_category=30)
-        scraper_mubawab.run(gouvernorats_slugs=None, max_pages_per_combo=15)
-        scraper_tecnocasa.scrape_with_playwright()
+    if args.merge_only:
+        pass
+    elif args.full:
+        scraper_tecnocasa.run(max_annonces=None)
+        scraper_mubawab.run(gouvernorats_slugs=None)
+        scraper_tayara.run(max_pages_per_category=None)
     else:
         print("Mode TEST (couverture restreinte). Utilise --full pour la collecte complète.\n")
-        scraper_tayara.run(max_pages_per_category=2)
-        scraper_mubawab.run(gouvernorats_slugs=["tunis", "ariana"], max_pages_per_combo=2)
-        # Tecnocasa nécessite Playwright installé -> commenté par défaut en mode test
-        # scraper_tecnocasa.scrape_with_playwright()
+        scraper_tecnocasa.run(max_annonces=3)
+        scraper_mubawab.run(gouvernorats_slugs=["tunis"])
+        scraper_tayara.run(max_pages_per_category=1)
 
     print("\nFusion des fichiers CSV...")
     merge_all()
