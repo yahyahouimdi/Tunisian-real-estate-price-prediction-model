@@ -7,15 +7,19 @@ Scope:
 The pipeline:
     1. Validates identifiers and sources
     2. Keeps sale listings only
-    3. Cleans and reconstructs prices
-    4. Normalizes governorates and cities
-    5. Cleans property size and room features
-    6. Normalizes boolean features
-    7. Normalizes floor information
+    3. Cleans and reconstructs prices (Tecnocasa fix, Tayara re-parse
+       after the title, prices written in thousands)
+    4. Normalizes governorates and cities, fixes city/governorate
+       conflicts, adds region, groups rare categories
+    5. Cleans surface and builds one bedroom feature (S+N)
+    6. Normalizes amenities: 1 / 0 / unknown for free-text sources
+    7. Normalizes floor information (+ numeric etage_num)
     8. Applies explicit plausibility bounds
-    9. Computes prix_m2 for auditing/outlier detection
-   10. Detects statistical prix_m2 outliers
-   11. Detects/removes duplicate listings safely
+    9. Computes prix_m2: too high -> price invalid, too low -> surface
+       invalid; removes placeholder prices
+   10. Flags statistical prix_m2 outliers (outlier_prix_m2)
+   11. Removes duplicates, incl. the same property across sites, and
+       builds groupe_bien for grouped train/test splits
    12. Exports clean and training-ready datasets
 
 IMPORTANT:
@@ -24,6 +28,7 @@ IMPORTANT:
 """
 
 import re
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -51,7 +56,6 @@ BOUNDS = {
     "prix_dt": (50_000, 10_000_000),
     "prix_m2": (300, 15_000),
     "surface_m2": (30, 2_500),
-    "nb_pieces": (1, 15),
     "nb_chambres": (0, 10),
     "nb_salles_bain": (0, 8),
 }
@@ -416,14 +420,129 @@ fixed = df.loc[
     "description_brute"
 ].apply(extract_tecnocasa_price)
 
+# Old scraper (raw_v1): prix_dt could be the monthly credit value and the
+# real price was in the card text. The current scraper reads the numeric
+# price from the page JSON: its descriptions don't match the pattern, and
+# the scraped price is kept.
 df.loc[
-    mask_tec,
+    fixed.index[fixed.notna()],
     "prix_dt"
-] = fixed
+] = fixed[fixed.notna()]
 
 note(
-    f"\n### 2) Prix Tecnocasa corrigés : "
+    f"\n### 2) Prix Tecnocasa corrigés (format ancien scraper) : "
     f"{fixed.notna().sum()}/{mask_tec.sum()}"
+)
+
+
+# ------------------------------------------------------------
+# 4a-bis) TAYARA
+# ------------------------------------------------------------
+
+"""
+Tayara page text contains "<titre> <prix> DT". The scraper parsed
+the price with a greedy regex, so trailing digits of the title were
+glued onto the price:
+
+    "MENZAH 6"  + "248 000 DT"  ->  6 248 000
+    "99958728"  + "550 000 DT"  ->  728 550 000
+
+We re-parse the number located immediately after the exact title.
+
+Sellers also often write prices in thousands ("280 DT" = 280 000 DT).
+Values in THOUSANDS_RANGE are multiplied by 1000, and kept only if the
+result passes the price bounds and the prix_m2 bounds (when the surface
+is known).
+"""
+
+THOUSANDS_RANGE = (30, 5_000)
+
+
+def extract_tayara_price(title, text):
+
+    if not isinstance(title, str) or not isinstance(text, str):
+        return None
+
+    title = re.sub(r"\s+", " ", title).strip()
+    text = re.sub(r"\s+", " ", text)
+
+    if not title:
+        return None
+
+    m = re.search(
+        re.escape(title)
+        + r" ?(\d{1,3}(?:[ . ]\d{3})*) ?DT\b",
+        text
+    )
+
+    if not m:
+        return None
+
+    return int(re.sub(r"[ . ]", "", m.group(1)))
+
+
+mask_tay = df["source"].eq("tayara")
+
+tay_parsed = df.loc[mask_tay].apply(
+    lambda row: extract_tayara_price(
+        row["titre"],
+        row["description_brute"]
+    ),
+    axis=1
+)
+
+tay_parsed = pd.to_numeric(tay_parsed, errors="coerce")
+
+old_tay_price = pd.to_numeric(
+    df.loc[mask_tay, "prix_dt"],
+    errors="coerce"
+)
+
+# Re-parsing only applies to the old scraper (raw_v1), whose text held
+# "<titre> <prix> DT". The current scraper reads the numeric price from the
+# page JSON: it is kept, and only the thousands rule below applies to it.
+reparsed = tay_parsed.notna()
+
+tay_parsed = tay_parsed.fillna(old_tay_price)
+
+tay_surface = pd.to_numeric(
+    df.loc[mask_tay, "surface_m2"],
+    errors="coerce"
+)
+
+# Prices written in thousands
+in_thousands = tay_parsed.between(*THOUSANDS_RANGE)
+
+scaled = tay_parsed.where(~in_thousands, tay_parsed * 1000)
+
+scaled_m2 = scaled / tay_surface
+
+scaled_ok = (
+    scaled.between(PRICE_FLOOR, PRICE_CEIL)
+    & (
+        tay_surface.isna()
+        | scaled_m2.between(*BOUNDS["prix_m2"])
+    )
+)
+
+# Thousands values that fail the checks become missing
+tay_parsed = scaled.where(~in_thousands | scaled_ok)
+
+matched = tay_parsed.notna() | (in_thousands & ~scaled_ok)
+
+changed = matched & (tay_parsed != old_tay_price)
+
+df.loc[
+    tay_parsed.index[matched],
+    "prix_dt"
+] = tay_parsed[matched]
+
+note(
+    f"### 2b) Prix Tayara : {reparsed.sum()}/{mask_tay.sum()} re-parsés "
+    f"après le titre (ancien scraper), "
+    f"{changed.sum()} modifiés "
+    f"(dont {(in_thousands & scaled_ok).sum()} écrits en milliers x1000, "
+    f"{(in_thousands & ~scaled_ok).sum()} milliers rejetés)"
 )
 
 
@@ -465,7 +584,12 @@ df.loc[
 # 4d) TND EXTRACTION
 # ------------------------------------------------------------
 
-still_missing = df["prix_dt"].isna()
+# Mubawab is excluded: a page without price ("Prix à consulter") still
+# shows the prices of OTHER listings (similar ads), which would be
+# picked up here.
+can_recover = df["source"].ne("mubawab")
+
+still_missing = df["prix_dt"].isna() & can_recover
 
 tnd_fill = df.loc[
     still_missing,
@@ -479,7 +603,7 @@ tnd_fill = df.loc[
 df.loc[
     still_missing,
     "prix_dt"
-] = tnd_fill
+] = pd.to_numeric(tnd_fill, errors="coerce")
 
 note(
     f"### 4) Prix récupérés via 'TND' : "
@@ -491,7 +615,7 @@ note(
 # 4e) DT EXTRACTION
 # ------------------------------------------------------------
 
-still_missing = df["prix_dt"].isna()
+still_missing = df["prix_dt"].isna() & can_recover
 
 dt_fill = df.loc[
     still_missing,
@@ -505,7 +629,7 @@ dt_fill = df.loc[
 df.loc[
     still_missing,
     "prix_dt"
-] = dt_fill
+] = pd.to_numeric(dt_fill, errors="coerce")
 
 note(
     f"### 5) Prix récupérés via 'DT' : "
@@ -570,6 +694,19 @@ ALIAS = {
 }
 
 
+def _strip_accents(text):
+
+    text = unicodedata.normalize("NFKD", text)
+
+    return "".join(c for c in text if not unicodedata.combining(c))
+
+
+OFFICIAL_BY_KEY = {
+    _strip_accents(g.lower()): g
+    for g in OFFICIAL
+}
+
+
 def normalize_gouv(value):
 
     if not isinstance(value, str):
@@ -589,6 +726,12 @@ def normalize_gouv(value):
         return base
 
     base_lower = base.lower()
+
+    # "tunis", "Gabes", "Medenine"... -> official spelling
+    base_key = _strip_accents(base_lower)
+
+    if base_key in OFFICIAL_BY_KEY:
+        return OFFICIAL_BY_KEY[base_key]
 
     if base_lower in ALIAS:
         return ALIAS[base_lower]
@@ -619,6 +762,39 @@ note(
 # ============================================================
 # 6) VILLE
 # ============================================================
+
+# Mubawab pages show the city before the governorate and the price:
+#   "... 2 Salles de bains El Aouina à Tunis 455 000 TND"
+MUBAWAB_VILLE = re.compile(
+    r"(?:m²|Pièces?|Chambres?|Salles? de bains?|Contacter)\s+"
+    r"([^\d\n]{2,40}?)\s+à\s+(?:"
+    + "|".join(re.escape(g) for g in OFFICIAL | {"Kef"})
+    + r")\s+\d"
+)
+
+
+def extract_mubawab_ville(text):
+
+    if not isinstance(text, str):
+        return pd.NA
+
+    m = MUBAWAB_VILLE.search(text)
+
+    return m.group(1).strip() if m else pd.NA
+
+
+mask_mub_ville = df["source"].eq("mubawab") & df["ville"].isna()
+
+mub_ville = df.loc[mask_mub_ville, "description_brute"].apply(
+    extract_mubawab_ville
+)
+
+df.loc[mask_mub_ville, "ville"] = mub_ville
+
+note(
+    f"\n### 7a) Ville Mubawab récupérée depuis la page : "
+    f"{mub_ville.notna().sum()}/{mask_mub_ville.sum()}"
+)
 
 villes_ref = sorted(
     [
@@ -704,6 +880,169 @@ note(
 note(
     f"Villes toujours manquantes : "
     f"{df['ville'].isna().sum()}"
+)
+
+
+# ------------------------------------------------------------
+# 7b) NORMALIZE CITY SPELLING
+# ------------------------------------------------------------
+
+"""
+The same place is written many ways:
+    "Cité Ennasr 2" / "cit ennasr 2" / "Ennasr 2"
+    "El Aouina" / "L Aouina" / "Laouina"
+    "Ariana Ville" / "Nabeul centre-ville"
+
+We lowercase, strip accents and punctuation, remove "cité",
+leading articles and "ville / centre-ville" suffixes.
+"""
+
+
+def normalize_ville(value):
+
+    if pd.isna(value):
+        return pd.NA
+
+    text = unicodedata.normalize("NFKD", str(value))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = re.sub(r"[’'`\-_,./()]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if text in {"", "autres villes", "autre", "autres"}:
+        return pd.NA
+
+    text = re.sub(r"\b(?:cite|cit)\b", " ", text)
+    text = re.sub(r"\bcentre ville\b|\bville\b", " ", text)
+    text = re.sub(r"^(?:el|l|la|le|les)\s+", "", text.strip())
+    text = re.sub(r"^laouina$", "aouina", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text if text else pd.NA
+
+
+n_raw_villes = df["ville"].dropna().nunique()
+
+df["ville_original"] = df["ville"]
+df["ville"] = df["ville"].apply(normalize_ville)
+
+note(
+    f"### 7b) Orthographe des villes normalisée : "
+    f"{n_raw_villes} -> {df['ville'].dropna().nunique()} villes distinctes"
+)
+
+
+# ------------------------------------------------------------
+# 7c) CITY / GOVERNORATE CONFLICTS
+# ------------------------------------------------------------
+
+"""
+A well-known city (>= 3 listings, >= 80% in one governorate) fixes the
+governorate of the rare rows that disagree, e.g. "Hammamet" labelled
+"Tunis" -> "Nabeul".
+"""
+
+ville_gouv = (
+    df.dropna(subset=["ville", "gouvernorat"])
+    .groupby("ville")["gouvernorat"]
+    .agg(
+        dominant=lambda s: s.mode().iloc[0],
+        share=lambda s: s.value_counts(normalize=True).iloc[0],
+        n="size",
+    )
+)
+
+reliable = ville_gouv[(ville_gouv["n"] >= 3) & (ville_gouv["share"] >= 0.8)]
+
+expected_gouv = df["ville"].map(reliable["dominant"])
+
+gouv_conflict = expected_gouv.notna() & (df["gouvernorat"] != expected_gouv)
+
+note(
+    f"### 7c) Conflits ville/gouvernorat corrigés : {gouv_conflict.sum()}"
+)
+
+df.loc[gouv_conflict, "gouvernorat"] = expected_gouv[gouv_conflict]
+
+
+# ------------------------------------------------------------
+# 7d) REGION + RARE CATEGORIES
+# ------------------------------------------------------------
+
+"""
+Rare categories cannot be learned and make a grouped/stratified split
+fail. Counts use listings with a known price (the rows the model
+learns from); only the presence of the target is used, not its value.
+
+    region      : the 7 official INS regions of Tunisia (new feature)
+    gouvernorat : < MIN_GOUV listings  -> "Autre_<region>"
+    ville       : < MIN_VILLE listings -> "autre_<gouvernorat>"
+"""
+
+REGIONS = {
+    "Grand Tunis": ["Tunis", "Ariana", "Ben Arous", "Manouba"],
+    "Nord-Est": ["Nabeul", "Zaghouan", "Bizerte"],
+    "Nord-Ouest": ["Béja", "Jendouba", "Le Kef", "Siliana"],
+    "Centre-Est": ["Sousse", "Monastir", "Mahdia", "Sfax"],
+    "Centre-Ouest": ["Kairouan", "Kasserine", "Sidi Bouzid"],
+    "Sud-Est": ["Gabès", "Médenine", "Tataouine"],
+    "Sud-Ouest": ["Gafsa", "Tozeur", "Kébili"],
+}
+
+GOUV_TO_REGION = {
+    gouv: region
+    for region, gouvs in REGIONS.items()
+    for gouv in gouvs
+}
+
+MIN_GOUV = 10
+MIN_VILLE = 5
+
+df["region"] = df["gouvernorat"].map(GOUV_TO_REGION)
+
+# Rare cities first, while the governorate name is still precise
+priced = df["prix_dt"].notna()
+
+ville_counts = df["ville"].map(
+    df.loc[priced, "ville"].value_counts()
+).fillna(0)
+
+rare_ville = df["ville"].notna() & (ville_counts < MIN_VILLE)
+
+df.loc[rare_ville, "ville"] = (
+    "autre_" + df.loc[rare_ville, "gouvernorat"].astype(str).str.lower()
+)
+
+gouv_counts = df["gouvernorat"].map(
+    df.loc[priced, "gouvernorat"].value_counts()
+).fillna(0)
+
+rare_gouv = df["gouvernorat"].notna() & (gouv_counts < MIN_GOUV)
+
+note(
+    f"### 7d) Villes rares (< {MIN_VILLE}) regroupées : {rare_ville.sum()} lignes "
+    f"-> {df['ville'].dropna().nunique()} catégories de ville\n"
+    f"### Gouvernorats rares (< {MIN_GOUV}) regroupés par région : "
+    f"{rare_gouv.sum()} lignes "
+    f"({', '.join(sorted(df.loc[rare_gouv, 'gouvernorat'].unique()))})"
+)
+
+df.loc[rare_gouv, "gouvernorat"] = "Autre_" + df.loc[rare_gouv, "region"]
+
+# City buckets still too small (e.g. "autre_gafsa") -> "autre_<region>"
+ville_counts = df["ville"].map(
+    df.loc[priced, "ville"].value_counts()
+).fillna(0)
+
+still_rare = df["ville"].notna() & (ville_counts < MIN_VILLE)
+
+df.loc[still_rare, "ville"] = (
+    "autre_" + df.loc[still_rare, "region"].str.lower()
+)
+
+note(
+    f"### Petits groupes de villes fusionnés par région : {still_rare.sum()} lignes "
+    f"-> {df['ville'].dropna().nunique()} catégories de ville"
 )
 
 
@@ -836,6 +1175,8 @@ def fix_column(
         )
     )
 
+    recovered = pd.to_numeric(recovered, errors="coerce")
+
     dataframe.loc[
         bad,
         col
@@ -866,220 +1207,84 @@ note(
 
 
 # ------------------------------------------------------------
-# BEDROOMS
+# BEDROOMS (single consistent feature: N of "S+N")
 # ------------------------------------------------------------
 
-n_bad, n_rec = fix_column(
-    df,
-    "nb_chambres",
-    r"chambres?",
-    BOUNDS["nb_chambres"]
-)
-
-note(
-    f"### 9b) nb_chambres : "
-    f"{n_bad} manquantes/aberrantes, "
-    f"{n_rec} récupérées"
-)
-
-
-# ============================================================
-# 10) NB_PIECES
-# ============================================================
-
 """
-IMPORTANT:
+Tunisian listings describe size as "S+N" where N = number of bedrooms.
 
-Do NOT calculate:
+The scraper stored this N in nb_pieces (common.extract_pieces), and
+filled nb_chambres with "X chambres" from the text OR a copy of
+nb_pieces. The two columns were therefore mostly the same value, and
+a mix of conventions produced fake "nb_chambres > nb_pieces" conflicts.
 
-    bedrooms + bathrooms + kitchens + salons
+We build ONE feature, nb_chambres = N, by priority:
+    1. S+N in the title
+    2. scraper nb_pieces (S+N found in the page text)
+    3. "X chambres" / "Chambres X" in the description
 
-because bathrooms and kitchens are not counted as "pièces"
-in the S+N convention.
-
-Instead:
-
-    nb_pieces ≈ nb_chambres + nb_salons
-
-However, we only infer a salon when there is reliable evidence.
-
-If the original nb_pieces is available and plausible, preserve it.
-
-If nb_pieces is missing, attempt to recover it from S+N notation
-or from bedrooms + explicitly detected salons.
+nb_pieces is kept only as nb_pieces_original for auditing and is NOT
+a model feature (it would just be nb_chambres + 1).
 """
+
+S_PLUS_N = re.compile(r"\bS\s*\+?\s*(\d{1,2})\b", re.IGNORECASE)
 
 
 def extract_s_plus_n(text):
 
     if not isinstance(text, str):
-        return None
+        return np.nan
 
-    # S+2, S + 2, S+3...
-    m = re.search(
-        r"\bS\s*\+\s*(\d{1,2})\b",
-        text,
-        flags=re.IGNORECASE
-    )
+    m = S_PLUS_N.search(text)
 
-    if not m:
-        return None
-
-    bedrooms = int(m.group(1))
-
-    # S+N = 1 living room + N bedrooms
-    pieces = bedrooms + 1
-
-    if BOUNDS["nb_pieces"][0] <= pieces <= BOUNDS["nb_pieces"][1]:
-        return pieces
-
-    return None
+    return int(m.group(1)) if m else np.nan
 
 
-def extract_nb_salons(text):
-
-    if not isinstance(text, str):
-        return None
-
-    text_lower = text.lower()
-
-    if re.search(
-        r"\b(?:trois|3)\s+salons?\b",
-        text_lower
-    ):
-        return 3
-
-    if re.search(
-        r"\b(?:deux|2)\s+salons?\b",
-        text_lower
-    ):
-        return 2
-
-    if re.search(
-        r"\bdouble\s+salon\b",
-        text_lower
-    ):
-        return 2
-
-    # Only return 1 if there is explicit evidence
-    if re.search(
-        r"\b(?:un|1)\s+salon\b",
-        text_lower
-    ):
-        return 1
-
-    return None
-
+chambres_lo, chambres_hi = BOUNDS["nb_chambres"]
 
 df["nb_pieces_original"] = df["nb_pieces"]
+df["nb_chambres_original"] = df["nb_chambres"]
 
-# Preserve valid original nb_pieces
-pieces_lo, pieces_hi = BOUNDS["nb_pieces"]
+from_title = df["titre"].apply(extract_s_plus_n)
 
-valid_original_pieces = (
-    df["nb_pieces"].notna()
-    & df["nb_pieces"].between(
-        pieces_lo,
-        pieces_hi
+from_scraper = df["nb_pieces"]
+
+from_text = df["description_brute"].apply(
+    lambda text: extract_structured_or_prose(
+        text,
+        r"chambres?",
+        BOUNDS["nb_chambres"]
     )
 )
+from_text = pd.to_numeric(from_text, errors="coerce")
 
-# Start with original valid values
-df["nb_pieces_clean"] = np.nan
+chambres_sources = {
+    "titre S+N": from_title,
+    "scraper S+N": from_scraper,
+    "texte 'X chambres'": from_text,
+}
 
-df.loc[
-    valid_original_pieces,
-    "nb_pieces_clean"
-] = df.loc[
-    valid_original_pieces,
-    "nb_pieces"
-]
+df["nb_chambres"] = np.nan
 
+for label, values in chambres_sources.items():
 
-# Recover S+N where nb_pieces is missing/invalid
-needs_pieces = df["nb_pieces_clean"].isna()
-
-s_plus_n = df.loc[
-    needs_pieces,
-    "description_brute"
-].apply(extract_s_plus_n)
-
-df.loc[
-    needs_pieces,
-    "nb_pieces_clean"
-] = s_plus_n
-
-
-# For remaining missing values:
-# bedrooms + explicitly detected salons
-needs_pieces = df["nb_pieces_clean"].isna()
-
-explicit_salons = df.loc[
-    needs_pieces,
-    "description_brute"
-].apply(extract_nb_salons)
-
-can_calculate = (
-    needs_pieces
-    & df["nb_chambres"].notna()
-)
-
-calculated_pieces = (
-    df.loc[can_calculate, "nb_chambres"]
-    + explicit_salons.loc[can_calculate].fillna(1)
-)
-
-calculated_pieces = calculated_pieces.where(
-    calculated_pieces.between(
-        pieces_lo,
-        pieces_hi
+    usable = (
+        df["nb_chambres"].isna()
+        & values.between(chambres_lo, chambres_hi)
     )
-)
 
-df.loc[
-    can_calculate,
-    "nb_pieces_clean"
-] = calculated_pieces
+    df.loc[usable, "nb_chambres"] = values[usable]
 
-
-df["nb_pieces"] = df["nb_pieces_clean"]
-
-df.drop(
-    columns=["nb_pieces_clean"],
-    inplace=True
-)
-
+    note(
+        f"### 9b) nb_chambres depuis {label} : {usable.sum()}"
+    )
 
 note(
-    f"\n### 10) nb_pieces nettoyé : "
-    f"{df['nb_pieces'].notna().sum()}/"
-    f"{len(df)} lignes"
+    f"### nb_chambres final : "
+    f"{df['nb_chambres'].notna().sum()}/{len(df)} renseignés "
+    f"(nb_pieces retiré des features : doublon de nb_chambres)"
 )
 
-
-# ============================================================
-# 11) LOGICAL CONSISTENCY
-# ============================================================
-
-# Bedrooms cannot exceed total pieces
-invalid_bedroom_piece = (
-    df["nb_chambres"].notna()
-    & df["nb_pieces"].notna()
-    & (df["nb_chambres"] > df["nb_pieces"])
-)
-
-note(
-    f"\n### 11) Incohérences "
-    f"nb_chambres > nb_pieces : "
-    f"{invalid_bedroom_piece.sum()}"
-)
-
-# Do not silently delete the listing.
-# Invalidate the inconsistent bedroom value.
-df.loc[
-    invalid_bedroom_piece,
-    "nb_chambres"
-] = np.nan
 
 
 # ============================================================
@@ -1087,7 +1292,6 @@ df.loc[
 # ============================================================
 
 for col in [
-    "nb_pieces",
     "nb_chambres",
     "nb_salles_bain",
 ]:
@@ -1194,6 +1398,92 @@ for col in BOOLEAN_COLUMNS:
     )
 
 
+# ------------------------------------------------------------
+# 13b) AMENITIES FROM FREE TEXT : 1 / 0 / UNKNOWN
+# ------------------------------------------------------------
+
+"""
+Mubawab amenities come from structured equipment tags: 1/0 is kept.
+
+Tayara and Tecnocasa amenities were set by the scraper to 1 if the
+keyword appeared ANYWHERE in the text, else 0. So:
+    - 0 meant "not mentioned", not "absent" (source bias: lift is 67%
+      on Mubawab vs 11% on Tayara)
+    - "sans ascenseur" was counted as 1
+
+For these sources we re-extract from the description:
+    1   -> mentioned positively
+    0   -> explicitly negated ("sans ascenseur", "non meublé")
+    NaN -> not mentioned (unknown; tree models handle missing values)
+"""
+
+FREE_TEXT_SOURCES = {"tayara", "tecnocasa"}
+
+AMENITY_PATTERNS = {
+    "ascenseur": r"ascenseur|مصعد",
+    "parking": r"parking|garage|stationnement|مستودع|مأوى",
+    "piscine": r"piscine|مسبح",
+    "climatisation": r"climatis\w*|clim\b|climatiseurs?|مكيف\w*",
+    "chauffage_central": r"chauffage\s+central\w*|تدفئة\s+مركزية",
+    "meuble": r"meubl[ée]e?s?|مفروش\w*",
+}
+
+NEGATION = re.compile(
+    r"(?:\bsans|\bpas\s+(?:de|d'|du)|\bnon|\bni|\baucun\w*|بدون|دون)"
+    r"[\s\w'’,/-]{0,15}$",
+    re.IGNORECASE
+)
+
+
+def extract_amenity(text, pattern):
+
+    if not isinstance(text, str):
+        return np.nan
+
+    found = np.nan
+
+    for m in re.finditer(pattern, text, flags=re.IGNORECASE):
+
+        before = text[max(0, m.start() - 20):m.start()]
+
+        if NEGATION.search(before):
+            found = 0
+        else:
+            return 1
+
+    return found
+
+
+mask_free_text = df["source"].isin(FREE_TEXT_SOURCES)
+
+amenity_text = (
+    df["titre"].fillna("").astype(str)
+    + " "
+    + df["description_brute"].fillna("").astype(str)
+)
+
+for col, pattern in AMENITY_PATTERNS.items():
+
+    # Tayara: scraper values are keyword-based (0 = not mentioned), always
+    # re-extracted. Tecnocasa: the current scraper reads structured
+    # equipment (True/False/unknown): text only fills the unknowns.
+    to_fill = mask_free_text & (
+        df["source"].eq("tayara") | df[col].isna()
+    )
+
+    values = amenity_text[to_fill].apply(
+        lambda text: extract_amenity(text, pattern)
+    )
+
+    df.loc[to_fill, col] = pd.array(values, dtype="Int64")
+
+    note(
+        f"### 13b) {col} (Tayara/Tecnocasa, texte libre) : "
+        f"{(values == 1).sum()} oui, {(values == 0).sum()} non, "
+        f"{values.isna().sum()} non mentionné"
+    )
+
+
 # ============================================================
 # 14) FLOOR NORMALIZATION
 # ============================================================
@@ -1271,6 +1561,31 @@ df["etage"] = df["etage"].apply(
     normalize_floor
 )
 
+# Numeric floor for the model: 9 sparse categories -> 1 ordered value.
+#   ground_floor -> 0, floor_n -> n, basement -> -1,
+#   last_floor / unknown -> missing (number of the floor not known)
+
+
+def floor_to_number(value):
+
+    if value == "ground_floor":
+        return 0
+
+    if value == "basement":
+        return -1
+
+    m = re.fullmatch(r"floor_(\d{1,2})", str(value))
+
+    return int(m.group(1)) if m else np.nan
+
+
+df["etage_num"] = df["etage"].apply(floor_to_number).astype("Int64")
+
+note(
+    f"\n### Étage numérique (etage_num) : "
+    f"{df['etage_num'].notna().sum()}/{len(df)} connus"
+)
+
 
 # ============================================================
 # 15) CALCULATE PRIX_M2
@@ -1301,23 +1616,54 @@ invalid_price_m2 = (
     )
 )
 
+too_low_m2 = invalid_price_m2 & (df["prix_m2"] < price_m2_lo)
+too_high_m2 = invalid_price_m2 & (df["prix_m2"] > price_m2_hi)
+
 note(
     f"\n### 12) prix_m2 hors bornes "
     f"[{price_m2_lo} ; {price_m2_hi}] : "
-    f"{invalid_price_m2.sum()} valeurs"
+    f"{invalid_price_m2.sum()} valeurs "
+    f"({too_low_m2.sum()} trop bas, {too_high_m2.sum()} trop hauts)"
 )
 
-# IMPORTANT:
-# prix_m2 is mainly an audit feature.
-# Do not automatically delete these listings here.
-#
-# We mark invalid prix_m2 as NaN rather than immediately
-# deleting the entire property listing.
+# The listing is kept, but the unreliable value is invalidated:
+#   - too low  -> surface is most likely the land area, not the
+#                 living area: surface_m2 is set missing
+#   - too high -> the price itself is implausible: prix_dt is set
+#                 missing, so the row is excluded from training
+
+df.loc[too_low_m2, "surface_m2"] = np.nan
+df.loc[too_high_m2, "prix_dt"] = np.nan
 
 df.loc[
     invalid_price_m2,
     "prix_m2"
 ] = np.nan
+
+
+# Placeholder prices (1 111 000, 111 111, 1 234 567, ...)
+def is_placeholder_price(value):
+
+    if pd.isna(value):
+        return False
+
+    digits = str(int(value)).rstrip("0")
+
+    return len(digits) >= 4 and (
+        len(set(digits)) == 1
+        or digits in "123456789"
+        or digits in "987654321"
+    )
+
+
+placeholder_price = df["prix_dt"].apply(is_placeholder_price)
+
+note(
+    f"### 12b) Prix factices (1 111 000, 1 234 567...) : "
+    f"{placeholder_price.sum()} invalidés"
+)
+
+df.loc[placeholder_price, ["prix_dt", "prix_m2"]] = np.nan
 
 
 # ============================================================
@@ -1397,10 +1743,14 @@ note(
 
 # IMPORTANT:
 # We do NOT delete the listing.
-# We only invalidate prix_m2.
+# We only invalidate prix_m2 and flag the row.
 #
-# The target prix_dt remains untouched.
+# The target prix_dt remains untouched. The flag lets the modelling
+# step compare results with / without these listings. It is derived
+# from the target, so it must NOT be used as a model feature.
 #
+df["outlier_prix_m2"] = iqr_flags.astype("Int64")
+
 df.loc[
     iqr_flags,
     "prix_m2"
@@ -1514,6 +1864,99 @@ df.drop(
 )
 
 
+# ------------------------------------------------------------
+# 19b) SAME PROPERTY, DIFFERENT TITLE / DIFFERENT SITE
+# ------------------------------------------------------------
+
+"""
+The same property is often reposted with a new title, or posted on
+both Tayara and Mubawab. Candidates share:
+
+    gouvernorat + type_bien + prix_dt + surface_m2
+
+Within a candidate group, two rows are the SAME property when their
+nb_chambres and ville are compatible (equal, or one is missing).
+We keep the most complete row and drop the others.
+
+Rows of a group that are NOT the same property (e.g. different units
+of one promoter project) are kept, but share a 'groupe_bien' id so the
+train/test split keeps them together (GroupKFold). Every other row
+gets its own id as group. groupe_bien is NOT a model feature.
+"""
+
+property_key = ["gouvernorat", "type_bien", "prix_dt", "surface_m2"]
+
+completeness = df[
+    ["ville", "surface_m2", "nb_chambres", "nb_salles_bain"]
+].notna().sum(axis=1) + df["etage"].ne("unknown")
+
+
+def compatible(a, b):
+
+    if pd.notna(a) and pd.notna(b):
+        return str(a).strip().lower() == str(b).strip().lower()
+
+    return True
+
+
+has_key = df[property_key].notna().all(axis=1)
+
+key_id = (
+    df.loc[has_key]
+    .groupby(property_key)
+    .ngroup()
+)
+
+group_size = key_id.map(key_id.value_counts())
+
+df["groupe_bien"] = df["source_id"]
+
+drop_ids = []
+n_cross_site = 0
+
+for gid, members in key_id[group_size > 1].groupby(key_id):
+
+    rows = df.loc[members.index].assign(
+        _completeness=completeness.loc[members.index]
+    ).sort_values("_completeness", ascending=False)
+
+    kept = []
+
+    for idx, row in rows.iterrows():
+
+        same_as = next(
+            (
+                k for k in kept
+                if compatible(row["nb_chambres"], df.at[k, "nb_chambres"])
+                and compatible(row["ville"], df.at[k, "ville"])
+            ),
+            None
+        )
+
+        if same_as is None:
+            kept.append(idx)
+        else:
+            drop_ids.append(idx)
+            n_cross_site += row["source"] != df.at[same_as, "source"]
+
+    if len(kept) > 1:
+        df.loc[kept, "groupe_bien"] = f"bien_{gid}"
+
+note(
+    f"### 15b) Même bien (gouvernorat+type+prix+surface, "
+    f"chambres/ville compatibles) : {len(drop_ids)} doublons supprimés "
+    f"(dont {n_cross_site} inter-sites)"
+)
+
+df = df.drop(index=drop_ids).copy()
+
+note(
+    f"### Groupes 'groupe_bien' partagés (unités d'un même projet) : "
+    f"{df['groupe_bien'].str.startswith('bien_').sum()} lignes, "
+    f"{df.loc[df['groupe_bien'].str.startswith('bien_'), 'groupe_bien'].nunique()} groupes"
+)
+
+
 # ============================================================
 # 20) REMOVE INVALID TARGET ROWS FOR TRAINING
 # ============================================================
@@ -1539,21 +1982,26 @@ df_final = df.copy()
 # Columns useful for audit / traceability
 audit_columns = [
     "id",
+    "groupe_bien",
     "source",
     "type_transaction",
     "type_bien",
+    "region",
     "gouvernorat",
+    "ville_original",
     "ville",
     "prix_dt_original",
     "prix_dt",
     "prix_m2",
+    "outlier_prix_m2",
     "surface_m2",
     "nb_pieces_original",
-    "nb_pieces",
+    "nb_chambres_original",
     "nb_chambres",
     "nb_salles_bain",
     "etage_original",
     "etage",
+    "etage_num",
     "ascenseur",
     "parking",
     "piscine",
@@ -1586,24 +2034,29 @@ prix_dt = TARGET
 prix_m2 = prix_dt / surface_m2
 
 Therefore prix_m2 MUST NOT be part of X.
+
+Feature selection (kept in the clean/audit file, excluded from X):
+    - source   : unknown when a user enters their own property;
+                 weak signal (median prices 310k-360k for all sites)
+    - meuble   : almost no relation to price, 61% unknown
+    - nb_pieces: duplicate of nb_chambres (S+N)
+    - etage    : replaced by the numeric etage_num
 """
 
 model_features = [
-    "source",
     "type_bien",
+    "region",
     "gouvernorat",
     "ville",
     "surface_m2",
-    "nb_pieces",
     "nb_chambres",
     "nb_salles_bain",
-    "etage",
+    "etage_num",
     "ascenseur",
     "parking",
     "piscine",
     "climatisation",
     "chauffage_central",
-    "meuble",
 ]
 
 target = "prix_dt"
@@ -1635,8 +2088,11 @@ df_final.to_csv(
     index=False
 )
 
-# Training-ready dataset contains target + model features.
-train_columns = model_features + [target]
+# Training-ready dataset contains model features + target, plus
+# columns that are NOT features:
+#   - outlier_prix_m2 : filtering experiments (derived from target)
+#   - groupe_bien     : groups for GroupKFold / grouped train-test split
+train_columns = model_features + [target, "outlier_prix_m2", "groupe_bien"]
 
 df_train_model = df_train_ready[
     [
