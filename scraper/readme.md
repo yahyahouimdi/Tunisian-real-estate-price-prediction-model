@@ -1,31 +1,53 @@
 # Scraper immobilier Tunisie — Tayara / Mubawab / Tecnocasa
 
-Scrape les annonces de vente/location immobilière sur 3 sites tunisiens et
-produit un dataset CSV unifié pour un modèle de prédiction de prix.
+Collecte les annonces de **vente** (appartements, maisons/villas) sur 3 sites
+tunisiens et produit un CSV unifié (`dataset_immo_tunisie.csv`) pour le
+nettoyage (`features collecting/clean_dataset.py`).
 
 ## Installation
 
 ```bash
-pip install -r requirements.txt --break-system-packages
-playwright install chromium   # nécessaire uniquement pour scraper_tecnocasa.py
+pip install -r requirements.txt
 ```
+
+Playwright n'est plus nécessaire : les 3 sites sont lus avec `requests`.
 
 ## Usage
 
 ```bash
-# Test rapide (peu de pages, pour vérifier que tout fonctionne)
-python main.py
-
-# Collecte complète (long, à lancer une fois les sélecteurs validés)
-python main.py --full
+python main.py                # test rapide (~3 min, quelques dizaines d'annonces)
+python main.py --full         # collecte complète (plusieurs heures)
+python main.py --merge-only   # refait seulement la fusion des annonces_*.csv
 ```
 
-Chaque scraper peut aussi être lancé indépendamment :
-```bash
-python scraper_tayara.py
-python scraper_mubawab.py
-python scraper_tecnocasa.py   # nécessite Playwright installé
-```
+Chaque annonce est écrite dans `annonces_<site>.csv` dès qu'elle est collectée.
+Après une interruption (coupure réseau, Ctrl+C), relancer la même commande
+reprend là où la collecte s'était arrêtée.
+
+## Méthode par site (vérifiée en octobre 2026)
+
+| Site | Découverte des annonces | Données lues | Volume (vente) |
+|---|---|---|---|
+| **Tayara** | Pages de catégorie `?page=N`, toutes les pages | JSON `__NEXT_DATA__` : prix numérique, gouvernorat, délégation, description ; `adParams` : transaction, superficie, chambres, salles de bain | ~7 700 annonces vente + location ; les locations évidentes sont ignorées sans charger leur page |
+| **Mubawab** | Page 1 de chaque gouvernorat × type | Texte de la page : en-tête « ville à gouvernorat prix TND », tags surface/chambres | ~19–33 annonces par page |
+| **Tecnocasa** | Sitemap `residentiel.xml.gz` | JSON `:estate` de la page : prix et surface numériques, pièces, étage, équipements | ~1 300 annonces |
+
+## Règles respectées
+
+- **robots.txt** : chaque URL Mubawab/Tecnocasa est vérifiée avec
+  `common.robots_allowed` (gère les jokers `*`). Mubawab interdit `/*:`, donc
+  sa pagination (`...:p:2`) n'est **pas** collectée : seulement la page 1.
+- **Politesse** : 1,5–3,5 s entre deux requêtes (`common.polite_sleep`).
+- **Données personnelles** : les champs vendeur (nom, e-mail, téléphone) ne
+  sont jamais lus ; les numéros et e-mails écrits dans le texte des annonces
+  sont remplacés par `[tel]` / `[email]` à l'enregistrement.
+
+## Données de la première collecte
+
+`raw_v1/` contient les CSV bruts de la première version des scrapers
+(août–septembre 2026). Ils sont conservés tels quels pour la traçabilité. Les
+prix Tayara y sont pollués par les chiffres de fin de titre, et la partie
+Mubawab provient de pages paginées que robots.txt interdit.
 
 ## Schéma de sortie (`common.Annonce`)
 
@@ -33,44 +55,12 @@ python scraper_tecnocasa.py   # nécessite Playwright installé
 |---|---|
 | id, source, url | identifiants |
 | type_transaction | vente / location |
-| type_bien | appartement / maison_villa / ... |
+| type_bien | appartement / maison_villa |
 | gouvernorat, ville | localisation |
 | prix_dt | prix en dinars tunisiens |
 | surface_m2 | surface habitable |
-| nb_pieces, nb_chambres, nb_salles_bain | |
+| nb_pieces | N de « S+N » (nombre de chambres) |
+| nb_chambres, nb_salles_bain | |
 | etage, ascenseur, parking, piscine, climatisation, chauffage_central, meuble | |
-| description_brute | texte complet (tronqué à 3000 caractères) |
-
-## ⚠️ Points importants avant de lancer à grande échelle
-
-1. **Vérifie robots.txt et CGU de chaque site** (`/robots.txt`) avant tout
-   scraping massif, et respecte les délais entre requêtes (déjà intégrés
-   dans `common.polite_sleep`, 1.5–3.5s).
-2. **Tayara** : rendu HTML côté serveur (Next.js) → `requests` suffit.
-   Structure des URLs vérifiée en août 2026, mais peut changer sans préavis.
-3. **Mubawab** : structure la plus "propre" (caractéristiques déjà en tags).
-   Le scraper par défaut ne couvre que Tunis/Ariana/Sousse pour le test —
-   étends `GOUVERNORAT_SLUGS` dans `scraper_mubawab.py` pour couvrir les
-   24 gouvernorats.
-4. **Tecnocasa** : la grille d'annonces est chargée en JavaScript. Le script
-   utilise Playwright, mais le **sélecteur CSS des liens d'annonce
-   (`CARD_LINK_SELECTOR`) est à confirmer** en inspectant le site dans ton
-   navigateur (F12 → clic droit sur une annonce → Inspecter). C'est marqué
-   `TODO` dans le fichier.
-5. **Extraction par regex sur le texte** plutôt que par classes CSS précises :
-   plus robuste aux changements de design, mais peut rater des cas non
-   standards (prix en lettres, formats inhabituels). Pense à valider un
-   échantillon manuellement après le premier run.
-6. **Dédoublonnage** : le `main.py` fait un dédoublonnage grossier
-   (titre + gouvernorat + prix + surface) lors de la fusion. Vérifie la
-   qualité de ce dédoublonnage sur ton dataset réel.
-7. Ce code n'a **pas pu être testé en conditions réelles** dans cet
-   environnement (accès réseau restreint à des domaines comme pypi/github).
-   Teste-le d'abord sur un petit échantillon (`max_pages=1-2`) avant de
-   lancer une collecte complète.
-
-## Prochaine étape
-
-Une fois `dataset_immo_tunisie.csv` généré → passage au preprocessing
-(nettoyage, gestion des valeurs manquantes, encodage, split stratifié par
-gouvernorat) qu'on avait détaillé juste avant.
+| description_brute | texte de l'annonce (tronqué à 3000 caractères, contacts masqués) |
+| date_scraping, date_publication | dates de collecte et de publication |
