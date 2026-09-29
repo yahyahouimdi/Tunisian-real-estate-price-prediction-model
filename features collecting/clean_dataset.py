@@ -677,7 +677,8 @@ OFFICIAL = {
 
 
 ALIAS = {
-    "el menzah": "Tunis",
+    "la manouba": "Manouba",
+    "cap bon": "Nabeul",
     "le bardo": "Tunis",
     "ennasr": "Ariana",
     "bizerte nord": "Bizerte",
@@ -756,6 +757,86 @@ note(
     f"\n### 6) Gouvernorats normalisés. "
     f"Non résolus : "
     f"{df['gouvernorat'].isna().sum()}"
+)
+
+
+# ------------------------------------------------------------
+# 6b) GOVERNORATE FROM CITY
+# ------------------------------------------------------------
+
+"""
+Tecnocasa gives a region instead of a governorate ("Grand Tunis",
+"Cap Bon"). When the governorate is still unknown, it is deduced from
+the city:
+
+    CITY_TO_GOUV : Grand Tunis cities seen without a governorate
+    El Menzah    : 1-4 -> Tunis, 5-9 -> Ariana (number read from the city
+                   or the title); without a number it stays unknown
+
+Rows still unknown keep their region (REGION_LABELS) for the region
+feature.
+"""
+
+CITY_TO_GOUV = {
+    "oued ellil": "Manouba",
+    "mornaguia": "Manouba",
+    "denden": "Manouba",
+    "djedeida": "Manouba",
+    "douar hicher": "Manouba",
+    "borj el amri": "Manouba",
+    "tebourba": "Manouba",
+    "el battan": "Manouba",
+    "les berges du lac": "Tunis",
+    "berges du lac": "Tunis",
+    "ain zaghouan": "Tunis",
+    "bou mhel el bassatine": "Ben Arous",
+}
+
+REGION_LABELS = {
+    "grand tunis": "Grand Tunis",
+    "cap bon": "Nord-Est",
+}
+
+
+def city_key(value):
+
+    if not isinstance(value, str):
+        return ""
+
+    text = _strip_accents(value.lower())
+    text = re.sub(r"[’'`\-_,./()]", " ", text)
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def gouv_from_city(row):
+
+    city = city_key(row["ville"])
+
+    if city in CITY_TO_GOUV:
+        return CITY_TO_GOUV[city]
+
+    text = f"{city} {city_key(row['titre'])}"
+
+    if "menzah" in city:
+
+        m = re.search(r"menzah\s*(\d)", text)
+
+        if m:
+            return "Tunis" if int(m.group(1)) <= 4 else "Ariana"
+
+    return pd.NA
+
+
+missing_gouv = df["gouvernorat"].isna()
+
+from_city = df.loc[missing_gouv].apply(gouv_from_city, axis=1)
+
+df.loc[missing_gouv, "gouvernorat"] = from_city
+
+note(
+    f"### 6b) Gouvernorat déduit de la ville : "
+    f"{from_city.notna().sum()}/{missing_gouv.sum()}"
 )
 
 
@@ -999,6 +1080,14 @@ MIN_GOUV = 10
 MIN_VILLE = 5
 
 df["region"] = df["gouvernorat"].map(GOUV_TO_REGION)
+
+# Governorate still unknown: region from the source label ("Grand Tunis")
+region_from_label = (
+    df["gouvernorat_original"].astype("string").str.strip().str.lower()
+    .map(REGION_LABELS)
+)
+
+df["region"] = df["region"].fillna(region_from_label)
 
 # Rare cities first, while the governorate name is still precise
 priced = df["prix_dt"].notna()
